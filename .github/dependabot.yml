@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-dependencies:
+        dependency-type: development
+    ignore:
+      # ts-jest@29 peers on typescript ">=4.3 <7"; revisit when ts-jest supports TS 7.
+      - dependency-name: typescript
+        update-types: ['version-update:semver-major']
+      # @types/node must track the Node major that CI and the Dockerfile run.
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # Node 25 is a non-LTS (odd) release line; stay on LTS images only.
+      - dependency-name: node
+        versions: ['25.x']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # Service images pinned in docker-compose*.yml
+  - package-ecosystem: 'docker-compose'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    ignore:
+      # Major bumps of stateful services (databases, brokers, search) need a
+      # deliberate data-migration plan, not a drive-by version bump.
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']

@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege for the GITHUB_TOKEN; jobs that need more declare it themselves.
+permissions:
+  contents: read
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Prisma 7's client is generated into src/generated (gitignored), not by
+      # an @prisma/client postinstall hook, so typecheck needs it generated.
+      - run: npx prisma generate
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+
+  test:
+    name: Test & build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Service images come from mirror.gcr.io (Google's cache of popular Docker
+    # Hub images: no pull-rate limit, no Docker Hub auth outage). Service
+    # containers start before any step, so they cannot use the daemon-level
+    # mirror (with Docker Hub fallback) that other jobs set up. The cache only
+    # holds frequently pulled tags: if a new tag 404s there, use the plain
+    # Docker Hub name for that service.
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:16-alpine
+        env:
+          POSTGRES_USER: project_name
+          POSTGRES_PASSWORD: project_name_test_pw
+          POSTGRES_DB: project_name_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U project_name -d project_name_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://project_name:project_name_test_pw@localhost:5432/project_name_test?schema=public
+      JWT_SECRET: ci-test-secret-not-for-production-0123456789
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      - run: npm test -- --coverage
+      - run: npm run build
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [lint-and-typecheck, test]
+    # Service images: mirror.gcr.io, see the note on the first services block.
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:16-alpine
+        env:
+          POSTGRES_USER: project_name
+          POSTGRES_PASSWORD: project_name_test_pw
+          POSTGRES_DB: project_name_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U project_name -d project_name_smoke"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # BuildKit pulls Dockerfile base images itself, not through the Docker
+          # daemon: mirror.gcr.io first, Docker Hub on a cache miss.
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: project_name:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Building isn't enough: a runtime import that `npm prune --omit=dev`
+      # removed (graphql-tag, fixed in #42) let this image build fine but
+      # crash on start. Run it the way docker-compose.yml does (migrate, then
+      # start) and check it serves /healthz, can query the database, and
+      # shuts down cleanly on SIGTERM.
+      - name: Smoke-test runtime image
+        run: |
+          docker run -d --name project_name --network host \
+            -e NODE_ENV=production \
+            -e PORT=4000 \
+            -e 'DATABASE_URL=postgresql://project_name:project_name_test_pw@localhost:5432/project_name_smoke?schema=public' \
+            -e JWT_SECRET=ci-smoke-secret-not-for-production-0123456789 \
+            project_name:ci sh -c 'npx prisma migrate deploy && exec node dist/index.js'
+
+          healthy=
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:4000/healthz; then healthy=1; break; fi
+            [ "$(docker inspect -f '{{.State.Running}}' project_name)" = true ] || break
+            sleep 2
+          done
+          if [ -z "$healthy" ]; then
+            echo "::error::Container never served /healthz"
+            exit 1
+          fi
+
+          response=$(curl -fsS http://localhost:4000/graphql \
+            -H 'content-type: application/json' \
+            -d '{"query":"mutation { login(input: {email: \"smoke@example.com\", password: \"not-a-real-password\"}) { token } }"}')
+          echo "$response"
+          if ! echo "$response" | grep -q 'BAD_USER_INPUT'; then
+            echo "::error::GraphQL login mutation did not reach the database"
+            exit 1
+          fi
+
+          docker stop --time 20 project_name
+          exit_code=$(docker inspect -f '{{.State.ExitCode}}' project_name)
+          if [ "$exit_code" != 0 ]; then
+            echo "::error::Container exited with code $exit_code on SIGTERM"
+            exit 1
+          fi
+      - name: Container logs
+        if: always()
+        run: docker logs project_name || true
+
+  dependency-review:
+    name: Dependency review (PR diff)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0

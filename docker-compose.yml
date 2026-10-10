@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: project_name
+      POSTGRES_PASSWORD: project_name_dev_pw
+      POSTGRES_DB: project_name_dev
+    ports:
+      - '5432:5432'
+    volumes:
+      - project_name_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U project_name -d project_name_dev']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    ports:
+      - '4000:4000'
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://project_name:project_name_dev_pw@postgres:5432/project_name_dev?schema=public
+      JWT_SECRET: ${JWT_SECRET:?set a real JWT_SECRET in .env before running docker compose}
+      JWT_EXPIRES_IN: 15m
+      CORS_ORIGIN: '*'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # `exec` makes node PID 1 so it receives `docker compose stop`'s SIGTERM
+    # and shuts down gracefully; without it `sh` is PID 1, ignores SIGTERM,
+    # and the server is SIGKILLed after the 10s timeout.
+    command: sh -c "npx prisma migrate deploy && exec node dist/index.js"
+
+volumes:
+  project_name_postgres_data:
