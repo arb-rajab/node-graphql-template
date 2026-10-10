@@ -16,3 +16,14 @@
 # Why this does not apply or cannot be fixed yet, and what to re-check
 # before the expiry date.
 # """
+
+[[IgnoredVulns]]
+id = "GHSA-hp3w-g68c-fv3c"
+ignoreUntil = 2026-11-09
+reason = """
+sprintf-js 1.0.3 (medium, CVSS 6.9). Dev-dependency only (lint/test
+toolchain); never shipped in the runtime image (npm prune --omit=dev). No
+patched release exists upstream as of 2026-10-10. Before the expiry date:
+check for a fixed sprintf-js; if so update the lockfile and delete this
+entry, otherwise re-confirm and renew.
+"""
