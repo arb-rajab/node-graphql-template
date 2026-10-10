@@ -85,3 +85,8 @@ missing file without overwriting existing ones.
 
 See `SECURITY.md`. CI runs gitleaks, `npm audit`, osv-scanner and CodeQL.
 Dated dependency exemptions go in `osv-scanner.toml`.
+
+The pull-request job "Dependency review (PR diff)" needs GitHub's **dependency graph** turned
+on for the repository (Settings, Code security). Without it the job fails with "Dependency
+review is not supported on this repository". It is on by default for public repositories but
+can be off in repositories created from this template, so check it once after creating yours.
